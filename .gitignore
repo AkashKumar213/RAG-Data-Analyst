@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+venv/
+.DS_Store
+faiss_index/
+analysis_plots/
+temp*
+.env
