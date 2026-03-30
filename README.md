@@ -27,3 +27,24 @@ streamlit run agent_ui.py
 Upload Excel → "create scatter plot BU vs models_to_undeploy" → **Chart appears inline!**
 
 **Built for Data Scientists** - Your conversational data analyst! 🚀
+
+
+
+**Copy → Paste → Enter (3 Terminals)**
+
+**Terminal 1:**
+```bash
+ollama serve
+```
+
+**Terminal 2:**
+```bash
+streamlit run app.py --server.port 8502 --server.headless true
+```
+
+**Terminal 3:**
+```bash
+streamlit run agent_ui.py --server.port 8501
+```
+
+**45 seconds later → http://localhost:8501 = READY!** 🎉
