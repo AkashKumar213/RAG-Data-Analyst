@@ -16,53 +16,63 @@ from langchain_ollama import ChatOllama
 
 # ===== HANDLER FUNCTIONS (MUST BE BEFORE MAIN CODE) =====
 
+def build_chat_context(messages, last_n=4):
+    history = messages[-last_n:]
+    formatted = ""
+    for msg in history:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        formatted += f"{role}: {msg['content']}\n"
+    return formatted
 def handle_data_analysis(prompt: str, tabular_path: str) -> str:
-    """Handle data analysis mode."""
-    
-    # Try auto-plotting first
-    plot_patterns = [
-        r'(line|bar|scatter|histogram|box)\s+(?:chart|plot|graph)?\s+(?:of\s+)?(.+?)(?:\s+(?:vs|by|from)\s+(.+?))?(?:\s+from\s+data)?$',
-        r'(line|bar|scatter|histogram|box)\s+(.+)',
-    ]
-    
-    for pattern in plot_patterns:
-        match = re.search(pattern, prompt.lower())
-        if match:
-            groups = match.groups()
-            plot_type = groups[0]
-            cols_text = groups[1]
-            
-            cols = [col.strip() for col in cols_text.split(',')]
-            
-            try:
-                df = pd.read_csv(tabular_path) if tabular_path.endswith('.csv') else pd.read_excel(tabular_path)
-                
-                if len(cols) >= 2 and cols[0] in df.columns and cols[1] in df.columns:
-                    x_col, y_col = cols[0], cols[1]
-                    plot_result = create_simple_plot(
-                        tabular_path, 
-                        plot_type, 
-                        x_col, 
-                        y_col, 
-                        f"{y_col} vs {x_col}"
-                    )
-                    return f"📊 {plot_result}"
-            except Exception as e:
-                df = pd.read_csv(tabular_path) if tabular_path.endswith('.csv') else pd.read_excel(tabular_path)
-                return f"⚠️ Plot error: {str(e)}\n\n**Available columns**: {', '.join(df.columns.tolist())}"
-    
-    # If no plot pattern, do data analysis
-    if any(keyword in prompt.lower() for keyword in ['stats', 'summary', 'describe', 'info', 'columns']):
-        return analyze_tabular_data(tabular_path)
-    
-    # General questions about data
+    """Handle data analysis mode with memory + fixed plotting."""
+
+    chat_context = build_chat_context(st.session_state.messages)
+
+    # Load data
     try:
         df = pd.read_csv(tabular_path) if tabular_path.endswith('.csv') else pd.read_excel(tabular_path)
-        data_summary = f"**Dataset**: {len(df)} rows, {len(df.columns)} columns\n**Columns**: {', '.join(df.columns.tolist())}\n\n**First few rows**:\n{df.head().to_string()}"
-        
-        llm = ChatOllama(model="llama3")
-        
-        prompt_text = f"""You are a data analyst. Answer questions about this dataset concisely.
+    except Exception as e:
+        return f"❌ Error loading data: {str(e)}"
+
+    columns = df.columns.tolist()
+    prompt_lower = prompt.lower()
+
+    # =========================
+    # 🔥 FORCE PLOT HANDLING (FIX)
+    # =========================
+    if any(word in prompt_lower for word in ["plot", "chart", "graph"]):
+        mentioned_cols = [col for col in columns if col.lower() in prompt_lower]
+
+        if len(mentioned_cols) >= 2:
+            return create_simple_plot(
+                tabular_path,
+                "line",
+                mentioned_cols[0],
+                mentioned_cols[1],
+                f"{mentioned_cols[1]} vs {mentioned_cols[0]}"
+            )
+        else:
+            return f"⚠️ Couldn't detect columns.\nAvailable: {', '.join(columns)}"
+
+    # =========================
+    # STATS
+    # =========================
+    if any(keyword in prompt_lower for keyword in ['stats', 'summary', 'describe', 'info', 'columns']):
+        return analyze_tabular_data(tabular_path)
+
+    # =========================
+    # 🔥 LLM WITH MEMORY (FIX)
+    # =========================
+    data_summary = f"**Dataset**: {len(df)} rows, {len(df.columns)} columns\n"
+    data_summary += f"**Columns**: {', '.join(columns)}\n\n"
+    data_summary += df.head().to_string()
+
+    llm = ChatOllama(model="llama3")
+
+    prompt_text = f"""You are a data analyst.
+
+CHAT HISTORY:
+{chat_context}
 
 DATASET:
 {data_summary}
@@ -70,10 +80,8 @@ DATASET:
 QUESTION: {prompt}
 
 ANSWER:"""
-        
-        return llm.invoke(prompt_text).content
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+
+    return llm.invoke(prompt_text).content
 
 
 def handle_document_search(prompt: str) -> str:
@@ -84,8 +92,15 @@ def handle_document_search(prompt: str) -> str:
     if "empty" in db_info.lower():
         return "📌 Knowledge base is empty. Please upload documents first (PDF/TXT/Images)."
     
-    # Query FAISS only
-    response = ask_domain_knowledge(prompt, tabular_path=None)
+    chat_context = build_chat_context(st.session_state.messages)
+
+    response = ask_domain_knowledge(f"""
+    CHAT HISTORY:
+    {chat_context}
+
+    QUESTION:
+    {prompt}
+    """, tabular_path=None)
     
     # ✅ FIX: Don't disclose what documents contain
     # If LLM says "not in context" or mentions document names, hide that info
@@ -100,21 +115,46 @@ def handle_document_search(prompt: str) -> str:
     
     return response
 
-
 def handle_internet_search(prompt: str) -> str:
-    """Handle internet research mode (no DB, pure LLM)."""
-    
+    """Hybrid mode: Works with or without docs."""
+
     llm = ChatOllama(model="llama3")
-    
-    prompt_text = f"""You are a helpful research assistant. Answer the following question based on your knowledge.
-If you don't have enough information, suggest relevant sources or ask for clarification.
+    chat_context = build_chat_context(st.session_state.messages)
 
-QUESTION: {prompt}
+    # Check if docs exist
+    db_info = get_raw_related_documents("check_db", num_docs=1)
 
-ANSWER:"""
+    use_docs = "empty" not in db_info.lower()
+
+    retrieved_context = ""
     
+    if use_docs:
+        try:
+            retrieved_context = get_raw_related_documents(prompt, num_docs=3)
+        except:
+            retrieved_context = ""
+
+    prompt_text = f"""
+You are a smart research assistant.
+
+CHAT HISTORY:
+{chat_context}
+
+DOCUMENT CONTEXT (if available):
+{retrieved_context}
+
+USER QUESTION:
+{prompt}
+
+INSTRUCTIONS:
+- If document context exists → use it + your knowledge
+- If not → answer normally
+- Do NOT mention whether docs were used or not
+
+ANSWER:
+"""
+
     response = llm.invoke(prompt_text).content
-    
     return response
 
 
@@ -167,9 +207,9 @@ def list_saved_chats() -> list:
 
 # ===== PAGE CONFIG =====
 
-st.set_page_config(page_title="RAG Data Analyst Agent", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="TriSense AI", page_icon="🤖", layout="wide")
 
-st.title("🤖 RAG Data Analyst Agent")
+st.title("🤖 TriSense AI")
 st.markdown("**3 Independent Modes**: Data Analysis | Document Search | Internet Research")
 
 # Initialize session state
@@ -185,14 +225,22 @@ if "web_search_mode" not in st.session_state:
     st.session_state.web_search_mode = False
 if "editing_index" not in st.session_state:
     st.session_state.editing_index = None
+if "auto_save" not in st.session_state:
+    st.session_state.auto_save = False
 
 # ===== SIDEBAR: MODE SELECTION =====
 with st.sidebar:
+    if st.button("➕ New Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.tabular_path = None
+        st.session_state.df_info = ""
+        st.session_state.editing_index = None
+        st.rerun()
     st.header("⚙️ Mode Selection")
     mode = st.radio(
         "Choose Your Analysis Mode:",
         ["📊 Data Analysis", "📚 Document Search", "🌐 Internet Research"],
-        index=0 if st.session_state.current_mode is None else ["DATA", "DOC", "WEB"].index(st.session_state.current_mode)
+        index=2 if st.session_state.current_mode is None else ["DATA", "DOC", "WEB"].index(st.session_state.current_mode)
     )
     
     # Map mode name to mode code
@@ -201,6 +249,8 @@ with st.sidebar:
         "📚 Document Search": "DOC",
         "🌐 Internet Research": "WEB"
     }
+    st.session_state.auto_save = st.checkbox("⚡ Auto Save Chat", value=st.session_state.auto_save)
+    
     st.session_state.current_mode = mode_map[mode]
     st.session_state.web_search_mode = (st.session_state.current_mode == "WEB")
     
@@ -259,33 +309,54 @@ with st.sidebar:
         st.header("🌐 Internet Search")
         st.markdown("Search the web for any information")
         st.info("✅ No knowledge base needed - searches internet directly")
+        db_info = get_raw_related_documents("check_db", num_docs=1)
+        if "empty" in db_info.lower():
+            st.warning("📭 No documents found. Using pure internet knowledge.")
+        else:
+            st.success("📚 Knowledge base detected → Hybrid mode active")
 
     # ===== CHAT MANAGEMENT (ALL MODES) =====
     st.divider()
     st.header("💾 Chat Management")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("💾 Save Chat"):
-            result = save_chat()
-            st.info(result)
-    
-    with col2:
+    st.header("💬 Chats")
+
+    if st.session_state.auto_save:
         saved_chats = list_saved_chats()
+
         if saved_chats:
-            selected_chat = st.selectbox("📂 Load Chat", saved_chats)
-            if st.button("📖 Load"):
-                if load_chat(f"saved_chats/{selected_chat}"):
-                    st.success(f"✅ Loaded: {selected_chat}")
-                    st.rerun()
+            for chat_file in saved_chats[::-1]:
+                chat_name = chat_file.replace(".json", "")
+
+                with st.container():
+                    cols = st.columns([8, 1])
+
+                    # 👉 Chat Load Button (full clickable feel)
+                    with cols[0]:
+                        if st.button(
+                            f"🗂️ {chat_name}",
+                            key=f"load_{chat_file}",
+                            use_container_width=True
+                        ):
+                            if load_chat(f"saved_chats/{chat_file}"):
+                                st.rerun()
+
+                    with cols[1]:
+                        if st.button("⋮", key=f"menu_{chat_file}"):
+                            st.session_state[f"confirm_delete_{chat_file}"] = True
+
+                    if st.session_state.get(f"confirm_delete_{chat_file}", False):
+                        if st.button("Delete?", key=f"confirm_{chat_file}"):
+                            os.remove(f"saved_chats/{chat_file}")
+                            st.rerun()
+
+                    st.markdown("---")  # clean separator
         else:
-            st.info("No saved chats yet")
-    
-    # Clear chat button
-    if st.button("🗑️ Clear Chat"):
-        st.session_state.messages = []
-        st.rerun()
+            st.info("No chats yet")
+
+    else:
+        if st.button("💾 Save Chat"):
+            st.info(save_chat())
 
 # ===== MAIN CHAT AREA =====
 st.divider()
@@ -312,30 +383,42 @@ elif st.session_state.current_mode == "DOC":
 
 elif st.session_state.current_mode == "WEB":
     st.markdown("""
-    ### 🌐 Internet Research Mode
+   ### 🌐 Smart Research Mode (Hybrid)
+    - Works without documents
+    - If documents exist → auto uses them
+    - Combines LLM + retrieval seamlessly
     **What you can do:**
     - Search the internet for any topic
     - Get real-time information
     - No knowledge base required
     """)
-
-# Show messages with EDIT button
 for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        
-        # ✅ FIX: Add edit button for user messages
+        col1, col2 = st.columns([10, 1])
+
+        with col1:
+            st.markdown(msg["content"])
+
+        with col2:
+            if st.button("🗑️", key=f"delete_{idx}"):
+                st.session_state.messages.pop(idx)
+
+                # Also remove assistant reply if user msg
+                if msg["role"] == "user" and idx < len(st.session_state.messages):
+                    st.session_state.messages.pop(idx)
+
+                st.rerun()
+
+        # EDIT button for user
         if msg["role"] == "user":
-            col1, col2 = st.columns([10, 1])
-            with col2:
-                if st.button("✏️", key=f"edit_{idx}"):
-                    st.session_state.editing_index = idx
-        
-        # Show embedded plots
+            if st.button("✏️", key=f"edit_{idx}"):
+                st.session_state.editing_index = idx
+
+        # Show plots
         img_matches = re.findall(r'analysis_plots/[\w\-\.]+\.png', msg["content"])
         for img_path in img_matches:
             if os.path.exists(img_path):
-                st.image(img_path, caption="Generated Plot", use_container_width=True)
+                st.image(img_path, use_container_width=True)
 
 # ✅ FIX: Edit mode for re-asking questions
 if st.session_state.editing_index is not None:
@@ -348,14 +431,20 @@ if st.session_state.editing_index is not None:
     col1, col2 = st.columns(2)
     with col1:
         if st.button("✅ Save Edit"):
-            # Update the message
+            # Update message
             st.session_state.messages[idx]["content"] = edited_prompt
-            
-            # Remove subsequent assistant response
+
+            # Remove old assistant response
             if idx + 1 < len(st.session_state.messages):
                 st.session_state.messages.pop(idx + 1)
-            
+
+            # 🔥 Set trigger instead of running LLM here
+            st.session_state.edit_trigger = True
+            st.session_state.edit_prompt = edited_prompt
+            st.session_state.edit_insert_index = idx + 1
+
             st.session_state.editing_index = None
+
             st.rerun()
     
     with col2:
@@ -398,3 +487,5 @@ if prompt := st.chat_input(f"Ask anything ({['📊 Data', '📚 Docs', '🌐 Web
                     st.image(img_path, use_column_width=True)
     
     st.session_state.messages.append({"role": "assistant", "content": response})
+    if st.session_state.auto_save:
+        save_chat()
